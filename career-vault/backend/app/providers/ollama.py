@@ -146,6 +146,99 @@ Approved evidence:\n""" + evidence
         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
             return self._fallback_resume(records)
 
+    async def job_specific_package(
+        self, records: list[dict[str, Any]], job_title: str, job_description: str
+    ) -> dict[str, Any]:
+        """Tailor a resume + cover letter to one job posting from approved facts only.
+
+        The model may re-select, reorder, re-emphasize, and rephrase existing evidence to
+        mirror the job posting's language for ATS keyword matching. It must never invent
+        employers, roles, dates, skills, or metrics that are not present in the evidence.
+        """
+        evidence = "\n".join(
+            f"- type: {record['type']} | summary: {record['summary']} | details: {json.dumps(record.get('data', {}), ensure_ascii=False)}"
+            for record in records
+        )
+        prompt = f"""A candidate is applying to this role. Build a tailored, ATS-friendly, ONE-PAGE RESUME
+and a tailored COVER LETTER using ONLY the approved evidence below. Do not invent employers, roles,
+dates, years of experience, skills, metrics, or credentials that are not present in the evidence.
+
+This resume must read like an industry-standard, single-page resume — not a dump of every fact in the
+candidate's Career Vault. You MUST select and condense:
+- Include ONLY the 3-4 most relevant experience entries (employer/client engagements) for this specific
+  job. Leave out employers, clients, or projects that are not relevant to this posting, even if they
+  exist in the evidence.
+- For each included experience entry, keep at most 3-4 of the strongest, most relevant bullets. Each
+  bullet should be one tight line (roughly 12-20 words), not a full sentence with sub-clauses.
+- Include at most 10-12 of the most relevant skills, ordered by relevance to this job.
+- professional_summary must be exactly 2 sentences.
+- Include at most 3 certifications, 2 education entries, and 3 additional highlights — only the ones most
+  relevant to this job. Omit a section entirely if nothing relevant qualifies.
+The goal is a resume a hiring manager could scan in under 30 seconds and that prints to a single page.
+
+You may: reorder experience and bullets to put the most relevant items first, rephrase bullets
+to mirror the job posting's terminology (only when the underlying fact still matches), choose
+which skills/achievements to surface, and write a headline and professional summary aimed at
+this role. Naturally weave in exact keywords and phrases from the job posting where the
+candidate's real evidence supports them, since this improves ATS keyword matching. Do not
+stuff keywords that have no supporting evidence.
+
+Target job title: {job_title}
+
+Job posting / job-specific career description:
+{job_description}
+
+Return ONLY JSON in this exact shape:
+{{
+  "resume": {{
+    "headline": "short role/discipline headline tailored to this job",
+    "professional_summary": "exactly 2 factual sentences aimed at this job",
+    "skills": ["at most 10-12 skills, prioritized by relevance to this job"],
+    "experience": [{{"role": "", "company": "", "dates": "", "highlights": ["3-4 tight, factual, job-relevant bullets"]}}],
+    "certifications": ["at most 3, most relevant verified credentials"],
+    "education": ["at most 2, most relevant verified education entries"],
+    "additional_highlights": ["at most 3, most relevant verified items"]
+  }},
+  "cover_letter": "a complete 250-350 word cover letter body (no address block), professional tone, referencing 2-3 concrete pieces of the candidate's real evidence and connecting them to this specific role",
+  "keyword_matches": ["job-posting keyword or phrase that the resume evidence genuinely supports"],
+  "gap_analysis": {{
+    "match_score": 0,
+    "score_reasoning": "one short factual sentence on why this score, based only on the evidence vs. the posting's stated requirements",
+    "strengths": ["a requirement from the posting that the evidence clearly satisfies, with a brief reference to which evidence"],
+    "gaps": ["a requirement or preferred qualification from the posting that the evidence does NOT show, stated plainly"],
+    "suggestions": ["a specific, actionable step the candidate could take to close a gap or strengthen the application — e.g. a certification to pursue, a skill to gain hands-on experience with, a type of achievement to quantify, or a Career Vault fact to add through another interview session"]
+  }}
+}}
+Leave a field empty instead of guessing. Use compact bullet wording in the resume.
+
+For gap_analysis: match_score is an honest 0-100 estimate of this candidate's fit for THIS posting based
+strictly on the approved evidence versus the posting's stated must-have and preferred requirements — do
+not inflate it. List every requirement in the posting that the evidence does not support as a gap, in
+plain language a candidate could act on. Do not soften real gaps and do not invent evidence to close them.
+
+Approved evidence:
+""" + evidence
+        try:
+            async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=120.0) as client:
+                response = await client.post(
+                    "/api/chat",
+                    json={
+                        "model": settings.generation_model,
+                        "messages": [
+                            {"role": "system", "content": "You create accurate, evidence-only, job-tailored resumes, cover letters, and honest fit/gap assessments. You never fabricate facts and you never inflate a fit score to be encouraging."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "stream": False,
+                    },
+                )
+                response.raise_for_status()
+            parsed = json.loads(self._json_object(response.json()["message"]["content"]))
+            if not isinstance(parsed, dict):
+                raise ValueError("Job package was not a JSON object")
+            return self._safe_job_package(parsed, records)
+        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return self._fallback_job_package(records)
+
     @staticmethod
     def _json_object(content: str) -> str:
         start, end = content.find("{"), content.rfind("}")
@@ -198,6 +291,80 @@ Approved evidence:\n""" + evidence
         if any(result.values()):
             return result
         return OllamaProvider._fallback_resume(records)
+
+    @staticmethod
+    def _safe_job_package(package: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+        def text(value: Any, limit: int = 4000) -> str:
+            return str(value).strip()[:limit] if isinstance(value, str) else ""
+
+        def string_list(value: Any, maximum: int = 30, limit: int = 300) -> list[str]:
+            return [text(item, limit) for item in value[:maximum] if text(item, limit)] if isinstance(value, list) else []
+
+        resume = package.get("resume")
+        safe_resume = OllamaProvider._safe_resume(resume, records) if isinstance(resume, dict) else OllamaProvider._fallback_resume(records)
+        safe_resume = OllamaProvider._condense_for_one_page(safe_resume)
+        cover_letter = text(package.get("cover_letter"), 4000)
+        keyword_matches = string_list(package.get("keyword_matches"), 25, 80)
+        gap_analysis = OllamaProvider._safe_gap_analysis(package.get("gap_analysis"))
+        if not cover_letter:
+            return OllamaProvider._fallback_job_package(records)
+        return {"resume": safe_resume, "cover_letter": cover_letter, "keyword_matches": keyword_matches, "gap_analysis": gap_analysis}
+
+    @staticmethod
+    def _condense_for_one_page(resume: dict[str, Any]) -> dict[str, Any]:
+        """Hard cap on top of the model's own output, so a tailored resume stays a
+        realistic single page even if the model does not fully follow the length guidance."""
+        experience = []
+        for entry in resume.get("experience", [])[:4]:
+            experience.append({**entry, "highlights": entry.get("highlights", [])[:4]})
+        return {
+            **resume,
+            "skills": resume.get("skills", [])[:12],
+            "experience": experience,
+            "certifications": resume.get("certifications", [])[:3],
+            "education": resume.get("education", [])[:2],
+            "additional_highlights": resume.get("additional_highlights", [])[:3],
+        }
+
+    @staticmethod
+    def _safe_gap_analysis(gap_analysis: Any) -> dict[str, Any]:
+        def text(value: Any, limit: int = 400) -> str:
+            return str(value).strip()[:limit] if isinstance(value, str) else ""
+
+        def string_list(value: Any, maximum: int = 15, limit: int = 300) -> list[str]:
+            return [text(item, limit) for item in value[:maximum] if text(item, limit)] if isinstance(value, list) else []
+
+        if not isinstance(gap_analysis, dict):
+            return {"match_score": None, "score_reasoning": "", "strengths": [], "gaps": [], "suggestions": []}
+
+        raw_score = gap_analysis.get("match_score")
+        score: int | None = None
+        if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
+            score = max(0, min(100, round(raw_score)))
+
+        return {
+            "match_score": score,
+            "score_reasoning": text(gap_analysis.get("score_reasoning"), 400),
+            "strengths": string_list(gap_analysis.get("strengths")),
+            "gaps": string_list(gap_analysis.get("gaps")),
+            "suggestions": string_list(gap_analysis.get("suggestions")),
+        }
+
+    @staticmethod
+    def _fallback_job_package(records: list[dict[str, Any]]) -> dict[str, Any]:
+        resume = OllamaProvider._condense_for_one_page(OllamaProvider._fallback_resume(records))
+        cover_letter = (
+            "I was unable to draft a tailored cover letter while the local model is unavailable. "
+            "Please try again once Ollama is reachable; your approved Career Vault facts were not changed."
+        )
+        gap_analysis = {
+            "match_score": None,
+            "score_reasoning": "Fit could not be assessed while the local model is unavailable.",
+            "strengths": [],
+            "gaps": [],
+            "suggestions": ["Try again once Ollama is reachable to get a fit score and gap analysis for this posting."],
+        }
+        return {"resume": resume, "cover_letter": cover_letter, "keyword_matches": [], "gap_analysis": gap_analysis}
 
     @staticmethod
     def _fallback_resume(records: list[dict[str, Any]]) -> dict[str, Any]:

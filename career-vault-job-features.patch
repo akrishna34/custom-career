@@ -1,0 +1,727 @@
+diff --git a/career-vault/backend/app/db.py b/career-vault/backend/app/db.py
+index 6bc3b99..7cc2ff4 100644
+--- a/career-vault/backend/app/db.py
++++ b/career-vault/backend/app/db.py
+@@ -90,6 +90,27 @@ class ResumeDraft(Base):
+     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+ 
+ 
++class JobPackageDraft(Base):
++    """A job-specific resume + cover letter pair tailored to one job posting.
++
++    Kept separate from ResumeDraft (rather than adding nullable columns to it) so the
++    existing master-resume table and flow are untouched. Only approved CareerRecord
++    evidence is ever used to produce the resume/cover letter content stored here.
++    """
++
++    __tablename__ = "job_package_drafts"
++
++    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
++    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
++    job_title: Mapped[str] = mapped_column(String(200))
++    job_description: Mapped[str] = mapped_column(Text)
++    resume: Mapped[dict] = mapped_column(JSON)
++    cover_letter: Mapped[str] = mapped_column(Text)
++    keyword_matches: Mapped[dict] = mapped_column(JSON)
++    gap_analysis: Mapped[dict] = mapped_column(JSON)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
++
++
+ data_directory.mkdir(parents=True, exist_ok=True)
+ engine = create_engine(f"sqlite:///{database_path}", connect_args={"check_same_thread": False})
+ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+diff --git a/career-vault/backend/app/main.py b/career-vault/backend/app/main.py
+index 20f0428..2e173ce 100644
+--- a/career-vault/backend/app/main.py
++++ b/career-vault/backend/app/main.py
+@@ -18,6 +18,7 @@ from app.db import (
+     CareerInterviewSession,
+     CareerRecord,
+     FactProposal,
++    JobPackageDraft,
+     ResumeDraft,
+     SessionLocal,
+     User,
+@@ -25,7 +26,7 @@ from app.db import (
+ )
+ from app.interview import STAGES, next_stage, stage_for
+ from app.providers.ollama import OllamaProvider
+-from app.resume_document import render_master_resume
++from app.resume_document import render_cover_letter, render_master_resume, render_tailored_resume
+ 
+ password_hash = PasswordHash.recommended()
+ bearer = HTTPBearer(auto_error=False)
+@@ -82,10 +83,28 @@ class ProposalDecisionRequest(BaseModel):
+     decision: str = Field(pattern="^(approved|rejected)$")
+ 
+ 
++class JobPackageRequest(BaseModel):
++    job_title: str = Field(min_length=2, max_length=200)
++    job_description: str = Field(min_length=30, max_length=8000)
++
++
+ def serialize_resume(draft: ResumeDraft) -> dict:
+     return {"id": draft.id, "type": draft.resume_type, "content": draft.content, "created_at": draft.created_at.isoformat()}
+ 
+ 
++def serialize_job_package(draft: JobPackageDraft) -> dict:
++    return {
++        "id": draft.id,
++        "job_title": draft.job_title,
++        "job_description": draft.job_description,
++        "resume": draft.resume,
++        "cover_letter": draft.cover_letter,
++        "keyword_matches": draft.keyword_matches,
++        "gap_analysis": draft.gap_analysis,
++        "created_at": draft.created_at.isoformat(),
++    }
++
++
+ def get_db():
+     db = SessionLocal()
+     try:
+@@ -336,3 +355,62 @@ def download_master_resume_docx(resume_id: str, user: User = Depends(get_current
+     render_master_resume(export_path, user.display_name, draft.content)
+     filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-master-resume.docx"
+     return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
++
++
++@app.post("/api/job-packages")
++async def generate_job_package(
++    payload: JobPackageRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
++) -> dict:
++    records = db.scalars(select(CareerRecord).where(CareerRecord.user_id == user.id).order_by(CareerRecord.created_at)).all()
++    if not records:
++        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Approve some Career Vault facts before tailoring a resume to a job")
++    package = await OllamaProvider().job_specific_package(
++        [{"type": item.record_type, "summary": item.summary, "data": item.data} for item in records],
++        payload.job_title.strip(),
++        payload.job_description.strip(),
++    )
++    draft = JobPackageDraft(
++        user_id=user.id,
++        job_title=payload.job_title.strip(),
++        job_description=payload.job_description.strip(),
++        resume=package["resume"],
++        cover_letter=package["cover_letter"],
++        keyword_matches=package["keyword_matches"],
++        gap_analysis=package["gap_analysis"],
++    )
++    db.add(draft)
++    db.commit()
++    db.refresh(draft)
++    return serialize_job_package(draft) | {"evidence_count": len(records)}
++
++
++@app.get("/api/job-packages")
++def list_job_packages(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
++    drafts = db.scalars(
++        select(JobPackageDraft).where(JobPackageDraft.user_id == user.id).order_by(JobPackageDraft.created_at.desc())
++    ).all()
++    return [serialize_job_package(draft) for draft in drafts]
++
++
++@app.get("/api/job-packages/{package_id}/download/resume-docx")
++def download_job_resume_docx(package_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> FileResponse:
++    draft = db.get(JobPackageDraft, package_id)
++    if not draft or draft.user_id != user.id:
++        raise HTTPException(status_code=404, detail="Tailored resume not found")
++    export_directory = data_directory / "exports"
++    export_path = export_directory / user.id / f"career-vault-job-resume-{draft.id}.docx"
++    render_tailored_resume(export_path, user.display_name, draft.resume)
++    filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-{draft.job_title.strip().replace(' ', '-').lower() or 'tailored'}-resume.docx"
++    return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
++
++
++@app.get("/api/job-packages/{package_id}/download/cover-letter-docx")
++def download_job_cover_letter_docx(package_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> FileResponse:
++    draft = db.get(JobPackageDraft, package_id)
++    if not draft or draft.user_id != user.id:
++        raise HTTPException(status_code=404, detail="Tailored cover letter not found")
++    export_directory = data_directory / "exports"
++    export_path = export_directory / user.id / f"career-vault-job-cover-letter-{draft.id}.docx"
++    render_cover_letter(export_path, user.display_name, draft.job_title, draft.cover_letter)
++    filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-{draft.job_title.strip().replace(' ', '-').lower() or 'tailored'}-cover-letter.docx"
++    return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
+diff --git a/career-vault/backend/app/providers/ollama.py b/career-vault/backend/app/providers/ollama.py
+index 3ceef2f..ef473cb 100644
+--- a/career-vault/backend/app/providers/ollama.py
++++ b/career-vault/backend/app/providers/ollama.py
+@@ -146,6 +146,99 @@ Approved evidence:\n""" + evidence
+         except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+             return self._fallback_resume(records)
+ 
++    async def job_specific_package(
++        self, records: list[dict[str, Any]], job_title: str, job_description: str
++    ) -> dict[str, Any]:
++        """Tailor a resume + cover letter to one job posting from approved facts only.
++
++        The model may re-select, reorder, re-emphasize, and rephrase existing evidence to
++        mirror the job posting's language for ATS keyword matching. It must never invent
++        employers, roles, dates, skills, or metrics that are not present in the evidence.
++        """
++        evidence = "\n".join(
++            f"- type: {record['type']} | summary: {record['summary']} | details: {json.dumps(record.get('data', {}), ensure_ascii=False)}"
++            for record in records
++        )
++        prompt = f"""A candidate is applying to this role. Build a tailored, ATS-friendly, ONE-PAGE RESUME
++and a tailored COVER LETTER using ONLY the approved evidence below. Do not invent employers, roles,
++dates, years of experience, skills, metrics, or credentials that are not present in the evidence.
++
++This resume must read like an industry-standard, single-page resume — not a dump of every fact in the
++candidate's Career Vault. You MUST select and condense:
++- Include ONLY the 3-4 most relevant experience entries (employer/client engagements) for this specific
++  job. Leave out employers, clients, or projects that are not relevant to this posting, even if they
++  exist in the evidence.
++- For each included experience entry, keep at most 3-4 of the strongest, most relevant bullets. Each
++  bullet should be one tight line (roughly 12-20 words), not a full sentence with sub-clauses.
++- Include at most 10-12 of the most relevant skills, ordered by relevance to this job.
++- professional_summary must be exactly 2 sentences.
++- Include at most 3 certifications, 2 education entries, and 3 additional highlights — only the ones most
++  relevant to this job. Omit a section entirely if nothing relevant qualifies.
++The goal is a resume a hiring manager could scan in under 30 seconds and that prints to a single page.
++
++You may: reorder experience and bullets to put the most relevant items first, rephrase bullets
++to mirror the job posting's terminology (only when the underlying fact still matches), choose
++which skills/achievements to surface, and write a headline and professional summary aimed at
++this role. Naturally weave in exact keywords and phrases from the job posting where the
++candidate's real evidence supports them, since this improves ATS keyword matching. Do not
++stuff keywords that have no supporting evidence.
++
++Target job title: {job_title}
++
++Job posting / job-specific career description:
++{job_description}
++
++Return ONLY JSON in this exact shape:
++{{
++  "resume": {{
++    "headline": "short role/discipline headline tailored to this job",
++    "professional_summary": "exactly 2 factual sentences aimed at this job",
++    "skills": ["at most 10-12 skills, prioritized by relevance to this job"],
++    "experience": [{{"role": "", "company": "", "dates": "", "highlights": ["3-4 tight, factual, job-relevant bullets"]}}],
++    "certifications": ["at most 3, most relevant verified credentials"],
++    "education": ["at most 2, most relevant verified education entries"],
++    "additional_highlights": ["at most 3, most relevant verified items"]
++  }},
++  "cover_letter": "a complete 250-350 word cover letter body (no address block), professional tone, referencing 2-3 concrete pieces of the candidate's real evidence and connecting them to this specific role",
++  "keyword_matches": ["job-posting keyword or phrase that the resume evidence genuinely supports"],
++  "gap_analysis": {{
++    "match_score": 0,
++    "score_reasoning": "one short factual sentence on why this score, based only on the evidence vs. the posting's stated requirements",
++    "strengths": ["a requirement from the posting that the evidence clearly satisfies, with a brief reference to which evidence"],
++    "gaps": ["a requirement or preferred qualification from the posting that the evidence does NOT show, stated plainly"],
++    "suggestions": ["a specific, actionable step the candidate could take to close a gap or strengthen the application — e.g. a certification to pursue, a skill to gain hands-on experience with, a type of achievement to quantify, or a Career Vault fact to add through another interview session"]
++  }}
++}}
++Leave a field empty instead of guessing. Use compact bullet wording in the resume.
++
++For gap_analysis: match_score is an honest 0-100 estimate of this candidate's fit for THIS posting based
++strictly on the approved evidence versus the posting's stated must-have and preferred requirements — do
++not inflate it. List every requirement in the posting that the evidence does not support as a gap, in
++plain language a candidate could act on. Do not soften real gaps and do not invent evidence to close them.
++
++Approved evidence:
++""" + evidence
++        try:
++            async with httpx.AsyncClient(base_url=settings.ollama_base_url, timeout=120.0) as client:
++                response = await client.post(
++                    "/api/chat",
++                    json={
++                        "model": settings.generation_model,
++                        "messages": [
++                            {"role": "system", "content": "You create accurate, evidence-only, job-tailored resumes, cover letters, and honest fit/gap assessments. You never fabricate facts and you never inflate a fit score to be encouraging."},
++                            {"role": "user", "content": prompt},
++                        ],
++                        "stream": False,
++                    },
++                )
++                response.raise_for_status()
++            parsed = json.loads(self._json_object(response.json()["message"]["content"]))
++            if not isinstance(parsed, dict):
++                raise ValueError("Job package was not a JSON object")
++            return self._safe_job_package(parsed, records)
++        except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError):
++            return self._fallback_job_package(records)
++
+     @staticmethod
+     def _json_object(content: str) -> str:
+         start, end = content.find("{"), content.rfind("}")
+@@ -199,6 +292,80 @@ Approved evidence:\n""" + evidence
+             return result
+         return OllamaProvider._fallback_resume(records)
+ 
++    @staticmethod
++    def _safe_job_package(package: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
++        def text(value: Any, limit: int = 4000) -> str:
++            return str(value).strip()[:limit] if isinstance(value, str) else ""
++
++        def string_list(value: Any, maximum: int = 30, limit: int = 300) -> list[str]:
++            return [text(item, limit) for item in value[:maximum] if text(item, limit)] if isinstance(value, list) else []
++
++        resume = package.get("resume")
++        safe_resume = OllamaProvider._safe_resume(resume, records) if isinstance(resume, dict) else OllamaProvider._fallback_resume(records)
++        safe_resume = OllamaProvider._condense_for_one_page(safe_resume)
++        cover_letter = text(package.get("cover_letter"), 4000)
++        keyword_matches = string_list(package.get("keyword_matches"), 25, 80)
++        gap_analysis = OllamaProvider._safe_gap_analysis(package.get("gap_analysis"))
++        if not cover_letter:
++            return OllamaProvider._fallback_job_package(records)
++        return {"resume": safe_resume, "cover_letter": cover_letter, "keyword_matches": keyword_matches, "gap_analysis": gap_analysis}
++
++    @staticmethod
++    def _condense_for_one_page(resume: dict[str, Any]) -> dict[str, Any]:
++        """Hard cap on top of the model's own output, so a tailored resume stays a
++        realistic single page even if the model does not fully follow the length guidance."""
++        experience = []
++        for entry in resume.get("experience", [])[:4]:
++            experience.append({**entry, "highlights": entry.get("highlights", [])[:4]})
++        return {
++            **resume,
++            "skills": resume.get("skills", [])[:12],
++            "experience": experience,
++            "certifications": resume.get("certifications", [])[:3],
++            "education": resume.get("education", [])[:2],
++            "additional_highlights": resume.get("additional_highlights", [])[:3],
++        }
++
++    @staticmethod
++    def _safe_gap_analysis(gap_analysis: Any) -> dict[str, Any]:
++        def text(value: Any, limit: int = 400) -> str:
++            return str(value).strip()[:limit] if isinstance(value, str) else ""
++
++        def string_list(value: Any, maximum: int = 15, limit: int = 300) -> list[str]:
++            return [text(item, limit) for item in value[:maximum] if text(item, limit)] if isinstance(value, list) else []
++
++        if not isinstance(gap_analysis, dict):
++            return {"match_score": None, "score_reasoning": "", "strengths": [], "gaps": [], "suggestions": []}
++
++        raw_score = gap_analysis.get("match_score")
++        score: int | None = None
++        if isinstance(raw_score, (int, float)) and not isinstance(raw_score, bool):
++            score = max(0, min(100, round(raw_score)))
++
++        return {
++            "match_score": score,
++            "score_reasoning": text(gap_analysis.get("score_reasoning"), 400),
++            "strengths": string_list(gap_analysis.get("strengths")),
++            "gaps": string_list(gap_analysis.get("gaps")),
++            "suggestions": string_list(gap_analysis.get("suggestions")),
++        }
++
++    @staticmethod
++    def _fallback_job_package(records: list[dict[str, Any]]) -> dict[str, Any]:
++        resume = OllamaProvider._condense_for_one_page(OllamaProvider._fallback_resume(records))
++        cover_letter = (
++            "I was unable to draft a tailored cover letter while the local model is unavailable. "
++            "Please try again once Ollama is reachable; your approved Career Vault facts were not changed."
++        )
++        gap_analysis = {
++            "match_score": None,
++            "score_reasoning": "Fit could not be assessed while the local model is unavailable.",
++            "strengths": [],
++            "gaps": [],
++            "suggestions": ["Try again once Ollama is reachable to get a fit score and gap analysis for this posting."],
++        }
++        return {"resume": resume, "cover_letter": cover_letter, "keyword_matches": [], "gap_analysis": gap_analysis}
++
+     @staticmethod
+     def _fallback_resume(records: list[dict[str, Any]]) -> dict[str, Any]:
+         grouped: dict[str, list[str]] = {}
+diff --git a/career-vault/backend/app/resume_document.py b/career-vault/backend/app/resume_document.py
+index 778833e..c9824b0 100644
+--- a/career-vault/backend/app/resume_document.py
++++ b/career-vault/backend/app/resume_document.py
+@@ -8,7 +8,7 @@ from pathlib import Path
+ from typing import Any
+ 
+ from docx import Document
+-from docx.enum.text import WD_ALIGN_PARAGRAPH
++from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+ from docx.oxml import OxmlElement
+ from docx.oxml.ns import qn
+ from docx.shared import Inches, Pt, RGBColor
+@@ -34,13 +34,13 @@ def _set_run_font(run: Any, size: float, bold: bool = False, color: RGBColor = I
+     run.font.color.rgb = color
+ 
+ 
+-def _add_section_heading(document: Document, text: str) -> None:
++def _add_section_heading(document: Document, text: str, size: float = 9) -> None:
+     paragraph = document.add_paragraph()
+     paragraph.paragraph_format.space_before = Pt(10)
+     paragraph.paragraph_format.space_after = Pt(4)
+     paragraph.paragraph_format.keep_with_next = True
+     run = paragraph.add_run(text.upper())
+-    _set_run_font(run, 9, bold=True, color=ACCENT)
++    _set_run_font(run, size, bold=True, color=ACCENT)
+ 
+ 
+ def _add_bullets(document: Document, items: list[str]) -> None:
+@@ -141,3 +141,169 @@ def render_master_resume(path: Path, display_name: str, resume: dict[str, Any])
+             _add_bullets(document, values)
+ 
+     document.save(path)
++
++
++def _add_bottom_border(paragraph: Any, color: str, size: int = 6) -> None:
++    """Add a thin bottom border under a paragraph, used as a section/header divider."""
++    properties = paragraph._p.get_or_add_pPr()
++    borders = OxmlElement("w:pBdr")
++    bottom = OxmlElement("w:bottom")
++    bottom.set(qn("w:val"), "single")
++    bottom.set(qn("w:sz"), str(size))
++    bottom.set(qn("w:space"), "4")
++    bottom.set(qn("w:color"), color)
++    borders.append(bottom)
++    properties.append(borders)
++
++
++def _add_split_line(document: Document, left_text: str, left_size: float, left_bold: bool, left_color: RGBColor, right_text: str, right_size: float, right_color: RGBColor, space_before: float, space_after: float) -> None:
++    """One line with the role/company on the left and dates flush right, via a right tab stop."""
++    paragraph = document.add_paragraph()
++    paragraph.paragraph_format.space_before = Pt(space_before)
++    paragraph.paragraph_format.space_after = Pt(space_after)
++    paragraph.paragraph_format.keep_with_next = True
++    tab_stops = paragraph.paragraph_format.tab_stops
++    tab_stops.add_tab_stop(Inches(7.1), WD_TAB_ALIGNMENT.RIGHT)
++    run = paragraph.add_run(left_text)
++    _set_run_font(run, left_size, bold=left_bold, color=left_color)
++    if right_text:
++        run = paragraph.add_run(f"\t{right_text}")
++        _set_run_font(run, right_size, color=right_color)
++
++
++def _resume_density(resume: dict[str, Any]) -> dict[str, float]:
++    """Pick tighter fonts/spacing as content grows, so a tailored resume stays a realistic
++    single page instead of overflowing. This is an approximation, not a guarantee — the
++    resume content itself is already capped upstream to a one-page-worthy amount."""
++    experience = [entry for entry in resume.get("experience", []) if isinstance(entry, dict)]
++    bullet_count = sum(len(_clean_list(entry.get("highlights"))) for entry in experience)
++    extra_sections = len(_clean_list(resume.get("certifications"))) + len(_clean_list(resume.get("education"))) + len(_clean_list(resume.get("additional_highlights")))
++    weight = bullet_count + len(experience) * 1.5 + extra_sections * 0.4
++
++    if weight <= 11:
++        return {"margin": 0.62, "name": 21, "headline": 10.8, "heading": 9.3, "body": 10, "bullet": 9.8, "bullet_gap": 2.4, "section_gap": 12}
++    if weight <= 16:
++        return {"margin": 0.55, "name": 19.5, "headline": 10.2, "heading": 9, "body": 9.4, "bullet": 9.2, "bullet_gap": 1.6, "section_gap": 9}
++    return {"margin": 0.48, "name": 18, "headline": 9.7, "heading": 8.6, "body": 8.9, "bullet": 8.7, "bullet_gap": 1, "section_gap": 7}
++
++
++def render_tailored_resume(path: Path, display_name: str, resume: dict[str, Any]) -> None:
++    """Create a polished, industry-standard, single-page-oriented DOCX for a job-tailored resume.
++
++    Unlike render_master_resume (which favors completeness), this renderer assumes the resume
++    content has already been curated to a small, job-relevant set of entries and adapts font
++    size/spacing to that content so the result reads like a real one-page resume: name header
++    with a divider, right-aligned dates on each role line, and tight, scannable bullets.
++    """
++    path.parent.mkdir(parents=True, exist_ok=True)
++    density = _resume_density(resume)
++    document = Document()
++    section = document.sections[0]
++    section.top_margin = Inches(density["margin"])
++    section.bottom_margin = Inches(density["margin"])
++    section.left_margin = Inches(density["margin"])
++    section.right_margin = Inches(density["margin"])
++
++    styles = document.styles
++    styles["Normal"].font.name = "Aptos"
++    styles["Normal"]._element.rPr.rFonts.set(qn("w:eastAsia"), "Aptos")
++    styles["Normal"].font.size = Pt(density["body"])
++    styles["Normal"].font.color.rgb = INK
++
++    name = document.add_paragraph()
++    name.paragraph_format.space_after = Pt(1)
++    run = name.add_run(display_name.strip().upper() or "CANDIDATE")
++    _set_run_font(run, density["name"], bold=True, color=ACCENT)
++
++    headline = str(resume.get("headline") or "").strip()
++    divider = document.add_paragraph()
++    divider.paragraph_format.space_after = Pt(density["section_gap"] * 0.7)
++    if headline:
++        run = divider.add_run(headline)
++        _set_run_font(run, density["headline"], color=MUTED)
++    _add_bottom_border(divider, "CDDDCF", size=10)
++
++    summary = str(resume.get("professional_summary") or "").strip()
++    if summary:
++        paragraph = document.add_paragraph()
++        paragraph.paragraph_format.space_after = Pt(density["section_gap"])
++        paragraph.paragraph_format.line_spacing = 1.12
++        run = paragraph.add_run(summary)
++        _set_run_font(run, density["body"])
++
++    skills = _clean_list(resume.get("skills"))
++    if skills:
++        _add_section_heading(document, "Core Skills", density["heading"])
++        paragraph = document.add_paragraph()
++        paragraph.paragraph_format.space_after = Pt(density["section_gap"])
++        paragraph.paragraph_format.line_spacing = 1.15
++        run = paragraph.add_run("  •  ".join(skills))
++        _set_run_font(run, density["bullet"], color=MUTED)
++
++    experience = resume.get("experience")
++    if isinstance(experience, list) and experience:
++        _add_section_heading(document, "Professional Experience", density["heading"])
++        for entry in experience:
++            if not isinstance(entry, dict):
++                continue
++            role = str(entry.get("role") or "Professional experience").strip()
++            company = str(entry.get("company") or "").strip()
++            dates = str(entry.get("dates") or "").strip()
++            left_text = f"{role} | {company}" if company else role
++            _add_split_line(document, left_text, density["body"], True, INK, dates, density["bullet"], MUTED, 5, 1)
++            for item in _clean_list(entry.get("highlights")):
++                bullet = document.add_paragraph(style="List Bullet")
++                bullet.paragraph_format.space_after = Pt(density["bullet_gap"])
++                bullet.paragraph_format.line_spacing = 1.05
++                run = bullet.add_run(item)
++                _set_run_font(run, density["bullet"])
++        document.paragraphs[-1].paragraph_format.space_after = Pt(density["section_gap"])
++
++    for section_key, heading in (("certifications", "Certifications"), ("education", "Education"), ("additional_highlights", "Additional Highlights")):
++        values = _clean_list(resume.get(section_key))
++        if values:
++            _add_section_heading(document, heading, density["heading"])
++            paragraph = document.add_paragraph()
++            paragraph.paragraph_format.space_after = Pt(density["section_gap"])
++            paragraph.paragraph_format.line_spacing = 1.1
++            run = paragraph.add_run("  •  ".join(values))
++            _set_run_font(run, density["bullet"], color=MUTED)
++
++    document.save(path)
++
++
++def render_cover_letter(path: Path, display_name: str, job_title: str, cover_letter_body: str) -> None:
++    """Create a simple, ATS-readable DOCX cover letter matching the resume's styling."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    document = Document()
++    section = document.sections[0]
++    section.top_margin = Inches(0.8)
++    section.bottom_margin = Inches(0.8)
++    section.left_margin = Inches(0.9)
++    section.right_margin = Inches(0.9)
++
++    styles = document.styles
++    styles["Normal"].font.name = "Aptos"
++    styles["Normal"]._element.rPr.rFonts.set(qn("w:eastAsia"), "Aptos")
++    styles["Normal"].font.size = Pt(10.5)
++    styles["Normal"].font.color.rgb = INK
++
++    name = document.add_paragraph()
++    name.paragraph_format.space_after = Pt(2)
++    run = name.add_run(display_name.strip() or "Candidate")
++    _set_run_font(run, 15, bold=True, color=ACCENT)
++
++    if job_title.strip():
++        role_line = document.add_paragraph()
++        role_line.paragraph_format.space_after = Pt(20)
++        run = role_line.add_run(f"Application for: {job_title.strip()}")
++        _set_run_font(run, 10, color=MUTED)
++
++    for paragraph_text in [line.strip() for line in cover_letter_body.split("\n") if line.strip()]:
++        paragraph = document.add_paragraph()
++        paragraph.paragraph_format.space_after = Pt(10)
++        paragraph.paragraph_format.line_spacing = 1.2
++        run = paragraph.add_run(paragraph_text)
++        _set_run_font(run, 10.5)
++
++    document.save(path)
+diff --git a/career-vault/frontend/src/App.tsx b/career-vault/frontend/src/App.tsx
+index 5a4b1ab..d3cef21 100644
+--- a/career-vault/frontend/src/App.tsx
++++ b/career-vault/frontend/src/App.tsx
+@@ -15,26 +15,78 @@ type Proposal = { id: string; entity_type: string; summary: string; status: "pen
+ type Stage = { key: string; label: string };
+ type Interview = { id: string; status: string; stage: string; stage_label: string; stages: Stage[]; messages: ChatMessage[]; proposals: Proposal[] };
+ type CareerRecord = { id: string; type: string; summary: string; data: Record<string, unknown> };
+-type MasterResume = {
++type ResumeContent = {
++  headline: string;
++  professional_summary: string;
++  skills: string[];
++  experience: { role: string; company: string; dates: string; highlights: string[] }[];
++  certifications: string[];
++  education: string[];
++  additional_highlights: string[];
++};
++type MasterResume = { id: string; type: string; created_at: string; evidence_count: number; content: ResumeContent };
++type GapAnalysis = {
++  match_score: number | null;
++  score_reasoning: string;
++  strengths: string[];
++  gaps: string[];
++  suggestions: string[];
++};
++type JobPackage = {
+   id: string;
+-  type: string;
++  job_title: string;
++  job_description: string;
+   created_at: string;
+   evidence_count: number;
+-  content: {
+-    headline: string;
+-    professional_summary: string;
+-    skills: string[];
+-    experience: { role: string; company: string; dates: string; highlights: string[] }[];
+-    certifications: string[];
+-    education: string[];
+-    additional_highlights: string[];
+-  };
++  resume: ResumeContent;
++  cover_letter: string;
++  keyword_matches: string[];
++  gap_analysis: GapAnalysis;
+ };
+ 
++function scoreLabel(score: number): string {
++  if (score >= 80) return "Strong match";
++  if (score >= 60) return "Fair match";
++  if (score >= 40) return "Partial match";
++  return "Weak match";
++}
++
++function scoreClass(score: number): string {
++  if (score >= 80) return "score-high";
++  if (score >= 60) return "score-mid";
++  if (score >= 40) return "score-low";
++  return "score-very-low";
++}
++
++function GapAnalysisCard({ analysis }: { analysis: GapAnalysis }) {
++  return <article className="gap-analysis">
++    <div className="resume-heading">
++      <p className="eyebrow">FIT &amp; GAP ANALYSIS</p>
++      {analysis.match_score !== null && <span className={`score-badge ${scoreClass(analysis.match_score)}`}>{analysis.match_score}/100 · {scoreLabel(analysis.match_score)}</span>}
++    </div>
++    {analysis.score_reasoning && <p className="score-reasoning">{analysis.score_reasoning}</p>}
++    {analysis.strengths.length > 0 && <><h4>Where your evidence is strong</h4><ul>{analysis.strengths.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
++    {analysis.gaps.length > 0 && <><h4>Gaps that may lower your chances</h4><ul className="gaps">{analysis.gaps.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
++    {analysis.suggestions.length > 0 && <><h4>What would help</h4><ul className="suggestions">{analysis.suggestions.map((item, index) => <li key={index}>{item}</li>)}</ul></>}
++    {analysis.strengths.length === 0 && analysis.gaps.length === 0 && analysis.suggestions.length === 0 && <p className="note">No gap analysis was available for this draft.</p>}
++  </article>;
++}
++
+ function Status({ ready, label }: { ready: boolean; label: string }) {
+   return <li className={ready ? "ready" : "waiting"}>{ready ? "●" : "○"} {label}</li>;
+ }
+ 
++function ResumeBody({ content }: { content: ResumeContent }) {
++  return <>
++    <p className="resume-summary">{content.professional_summary}</p>
++    {content.skills.length > 0 && <><h4>Core skills</h4><p className="skill-list">{content.skills.join(" · ")}</p></>}
++    {content.experience.length > 0 && <><h4>Experience</h4>{content.experience.map((entry, index) => <div className="experience" key={`${entry.role}-${index}`}><strong>{entry.role || "Professional experience"}{entry.company ? ` | ${entry.company}` : ""}</strong>{entry.dates && <small>{entry.dates}</small>}{entry.highlights.map((highlight, highlightIndex) => <p key={highlightIndex}>• {highlight}</p>)}</div>)}</>}
++    {content.certifications.length > 0 && <><h4>Certifications</h4><p>{content.certifications.join(" · ")}</p></>}
++    {content.education.length > 0 && <><h4>Education</h4><p>{content.education.join(" · ")}</p></>}
++    {content.additional_highlights.length > 0 && <><h4>Additional highlights</h4><p>{content.additional_highlights.join(" · ")}</p></>}
++  </>;
++}
++
+ export default function App() {
+   const [status, setStatus] = useState<SystemStatus | null>(null);
+   const [error, setError] = useState<string | null>(null);
+@@ -54,6 +106,10 @@ export default function App() {
+   const [generatingOverview, setGeneratingOverview] = useState(false);
+   const [masterResume, setMasterResume] = useState<MasterResume | null>(null);
+   const [generatingMasterResume, setGeneratingMasterResume] = useState(false);
++  const [jobTitle, setJobTitle] = useState("");
++  const [jobDescription, setJobDescription] = useState("");
++  const [jobPackage, setJobPackage] = useState<JobPackage | null>(null);
++  const [generatingJobPackage, setGeneratingJobPackage] = useState(false);
+ 
+   useEffect(() => {
+     fetch("/api/system/status")
+@@ -169,6 +225,46 @@ export default function App() {
+     }
+   }
+ 
++  async function generateJobPackage(event: FormEvent) {
++    event.preventDefault();
++    if (!jobDescription.trim() || generatingJobPackage) return;
++    setGeneratingJobPackage(true);
++    setError(null);
++    try {
++      const response = await authenticatedFetch("/api/job-packages", {
++        method: "POST",
++        body: JSON.stringify({ job_title: jobTitle.trim() || "Target role", job_description: jobDescription.trim() }),
++      });
++      const result = await response.json() as JobPackage & { detail?: string };
++      if (!response.ok) throw new Error(result.detail ?? "Could not tailor a resume for this job");
++      setJobPackage(result);
++    } catch (reason) {
++      setError(reason instanceof Error ? reason.message : "Could not tailor a resume for this job");
++    } finally {
++      setGeneratingJobPackage(false);
++    }
++  }
++
++  async function downloadJobFile(kind: "resume" | "cover-letter") {
++    if (!jobPackage) return;
++    setError(null);
++    try {
++      const response = await authenticatedFetch(`/api/job-packages/${jobPackage.id}/download/${kind}-docx`);
++      if (!response.ok) {
++        const result = await response.json() as { detail?: string };
++        throw new Error(result.detail ?? `Could not download the ${kind === "resume" ? "resume" : "cover letter"}`);
++      }
++      const url = URL.createObjectURL(await response.blob());
++      const link = document.createElement("a");
++      link.href = url;
++      link.download = `career-vault-${kind}.docx`;
++      link.click();
++      URL.revokeObjectURL(url);
++    } catch (reason) {
++      setError(reason instanceof Error ? reason.message : "Could not download the file");
++    }
++  }
++
+   async function downloadMasterResume() {
+     if (!masterResume) return;
+     setError(null);
+@@ -215,7 +311,32 @@ export default function App() {
+         {interview.status === "active" && <><form onSubmit={sendMessage} className="composer"><textarea value={message} onChange={(event) => setMessage(event.target.value)} placeholder="Answer in as much detail as you want." rows={3} /><button disabled={sending || !message.trim()}>{sending ? "Thinking locally…" : "Send"}</button></form><button className="secondary advance" onClick={advanceStage}>Complete this section → Next section</button></>}
+         {interview.proposals.length > 0 && <div className="proposals"><p className="eyebrow">FACTS TO CONFIRM</p>{interview.proposals.map((proposal) => <article key={proposal.id} className="proposal"><p><strong>{proposal.entity_type}</strong> · {proposal.summary}</p>{proposal.status === "pending" ? <div><button onClick={() => decideProposal(proposal.id, "approved")}>Approve</button><button className="secondary" onClick={() => decideProposal(proposal.id, "rejected")}>Reject</button></div> : <small>{proposal.status}</small>}</article>)}</div>}
+       </section>}
+-      {records.length > 0 && <section className="panel records"><p className="eyebrow">CONFIRMED CAREER VAULT</p><h2>Approved facts</h2>{records.map((record) => <p key={record.id}><strong>{record.type}</strong> · {record.summary}</p>)}<div className="overview-action"><button onClick={generateOverview} disabled={generatingOverview}>{generatingOverview ? "Writing overview locally…" : "Generate Candidate Overview"}</button><button onClick={generateMasterResume} disabled={generatingMasterResume}>{generatingMasterResume ? "Building master resume locally…" : "Create Master Resume"}</button></div>{overview && <article className="overview"><p className="eyebrow">CANDIDATE OVERVIEW · APPROX. 50–60 WORDS</p><p>{overview}</p><small>Generated from approved Career Vault records only.</small></article>}{masterResume && <article className="master-resume"><div className="resume-heading"><div><p className="eyebrow">MASTER RESUME · {masterResume.evidence_count} APPROVED FACTS</p><h3>{masterResume.content.headline || "Professional Profile"}</h3></div><button onClick={downloadMasterResume}>Download DOCX</button></div><p className="resume-summary">{masterResume.content.professional_summary}</p>{masterResume.content.skills.length > 0 && <><h4>Core skills</h4><p className="skill-list">{masterResume.content.skills.join(" · ")}</p></>}{masterResume.content.experience.length > 0 && <><h4>Experience</h4>{masterResume.content.experience.map((entry, index) => <div className="experience" key={`${entry.role}-${index}`}><strong>{entry.role || "Professional experience"}{entry.company ? ` | ${entry.company}` : ""}</strong>{entry.dates && <small>{entry.dates}</small>}{entry.highlights.map((highlight, highlightIndex) => <p key={highlightIndex}>• {highlight}</p>)}</div>)}</>}{masterResume.content.certifications.length > 0 && <><h4>Certifications</h4><p>{masterResume.content.certifications.join(" · ")}</p></>}{masterResume.content.education.length > 0 && <><h4>Education</h4><p>{masterResume.content.education.join(" · ")}</p></>}{masterResume.content.additional_highlights.length > 0 && <><h4>Additional highlights</h4><p>{masterResume.content.additional_highlights.join(" · ")}</p></>}<small>Draft generated locally from approved facts only. Review it before sharing.</small></article>}</section>}
++      {records.length > 0 && <section className="panel records"><p className="eyebrow">CONFIRMED CAREER VAULT</p><h2>Approved facts</h2>{records.map((record) => <p key={record.id}><strong>{record.type}</strong> · {record.summary}</p>)}<div className="overview-action"><button onClick={generateOverview} disabled={generatingOverview}>{generatingOverview ? "Writing overview locally…" : "Generate Candidate Overview"}</button><button onClick={generateMasterResume} disabled={generatingMasterResume}>{generatingMasterResume ? "Building master resume locally…" : "Create Master Resume"}</button></div>{overview && <article className="overview"><p className="eyebrow">CANDIDATE OVERVIEW · APPROX. 50–60 WORDS</p><p>{overview}</p><small>Generated from approved Career Vault records only.</small></article>}{masterResume && <article className="master-resume"><div className="resume-heading"><div><p className="eyebrow">MASTER RESUME · {masterResume.evidence_count} APPROVED FACTS</p><h3>{masterResume.content.headline || "Professional Profile"}</h3></div><button onClick={downloadMasterResume}>Download DOCX</button></div><ResumeBody content={masterResume.content} /><small>Draft generated locally from approved facts only. Review it before sharing.</small></article>}
++
++        <div className="job-package">
++          <p className="eyebrow">JOB-SPECIFIC TAILORING</p>
++          <h2>Paste a job description, get a tailored resume &amp; cover letter</h2>
++          <p className="note">Only your approved Career Vault facts are used. Nothing is invented — the model reorders, re-emphasizes, and rephrases your real evidence to match this job's language for ATS keyword matching.</p>
++          <form onSubmit={generateJobPackage} className="composer job-form">
++            <input value={jobTitle} onChange={(event) => setJobTitle(event.target.value)} placeholder="Job title (e.g. Senior Product Manager)" maxLength={200} />
++            <textarea value={jobDescription} onChange={(event) => setJobDescription(event.target.value)} placeholder="Paste the full job description here." rows={8} required minLength={30} />
++            <button disabled={generatingJobPackage || !jobDescription.trim()}>{generatingJobPackage ? "Tailoring locally…" : "Generate Tailored Resume & Cover Letter"}</button>
++          </form>
++          {jobPackage && <div className="job-package-result">
++            <GapAnalysisCard analysis={jobPackage.gap_analysis} />
++            <article className="master-resume">
++              <div className="resume-heading"><div><p className="eyebrow">TAILORED RESUME · {jobPackage.job_title}</p><h3>{jobPackage.resume.headline || "Professional Profile"}</h3></div><button onClick={() => downloadJobFile("resume")}>Download DOCX</button></div>
++              <ResumeBody content={jobPackage.resume} />
++              {jobPackage.keyword_matches.length > 0 && <><h4>Keywords matched from this posting</h4><p className="skill-list">{jobPackage.keyword_matches.join(" · ")}</p></>}
++              <small>Draft generated locally from approved facts only. Review it before sharing.</small>
++            </article>
++            <article className="cover-letter">
++              <div className="resume-heading"><p className="eyebrow">TAILORED COVER LETTER</p><button onClick={() => downloadJobFile("cover-letter")}>Download DOCX</button></div>
++              {jobPackage.cover_letter.split("\n").filter((line) => line.trim()).map((paragraph, index) => <p key={index}>{paragraph}</p>)}
++            </article>
++          </div>}
++        </div>
++        </section>}
+     </>}
+ 
+     <section className="panel system"><p className="eyebrow">LOCAL SYSTEM STATUS</p>{status && <ul><Status ready label="SQLite local database" /><Status ready={status.ollama_reachable} label="Ollama available at localhost" /><Status ready={status.generation_model_available} label="Qwen3 4B generation model" /><Status ready={status.embedding_model_available} label="EmbeddingGemma matching model" /></ul>}</section>
+diff --git a/career-vault/frontend/src/styles.css b/career-vault/frontend/src/styles.css
+index 775a224..c976d43 100644
+--- a/career-vault/frontend/src/styles.css
++++ b/career-vault/frontend/src/styles.css
+@@ -18,3 +18,7 @@ ul { list-style: none; padding: 0; margin: 28px 0 14px; display: grid; gap: 12px
+ .auth-panel { max-width: 480px; margin-top: 42px; }.composer input { border: 1px solid #cfd8d1; border-radius: 8px; padding: 12px; font: inherit; }.link-button { background: transparent; color: #216545; padding: 14px 0 0; }.welcome { margin-top: 36px; display: flex; gap: 18px; align-items: center; }.signout { padding: 8px 10px; }.secondary { background: #f3f5f3; color: #506056; }.advance { margin-top: 16px; }.stages { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 22px 0; }.stages li { padding: 6px 9px; border-radius: 99px; background: #f0f2ef; color: #59645e; font-size: .78rem; }.stages li.current { background: #dcecdf; color: #216545; font-weight: 700; }.records { margin-top: 40px; }.records p { border-top: 1px solid #e8ece8; margin: 10px 0 0; padding-top: 10px; }
+ .overview-action { margin-top: 24px; display: flex; flex-wrap: wrap; gap: 10px; }.overview { margin-top: 22px; padding: 20px; border-radius: 10px; background: #f0f6f1; }.overview p:not(.eyebrow) { font-family: Georgia, serif; font-size: 1.16rem; line-height: 1.55; margin: 8px 0 12px; }.overview small { color: #5a665f; }
+ .master-resume { margin-top: 22px; padding: 24px; border: 1px solid #cdddcf; border-radius: 10px; background: #fcfdfb; }.resume-heading { display: flex; gap: 16px; justify-content: space-between; align-items: start; }.resume-heading h3 { margin: 0; font-family: Georgia, serif; font-size: 1.5rem; }.resume-heading button { white-space: nowrap; }.resume-summary { line-height: 1.6; }.master-resume h4 { margin: 20px 0 6px; font-size: .82rem; color: #216545; letter-spacing: .08em; text-transform: uppercase; }.skill-list { color: #4f6658; }.experience { padding-top: 10px; }.experience small { display: block; color: #66746c; margin-top: 3px; }.experience p { margin: 4px 0; line-height: 1.45; }.master-resume > small { display: block; margin-top: 18px; color: #5a665f; }
++.job-package { margin-top: 40px; border-top: 1px solid #e0e4dd; padding-top: 32px; }.job-package h2 { font-size: 1.4rem; margin: 8px 0 6px; }.job-package .note { margin: 0 0 20px; }.job-form textarea { resize: vertical; border: 1px solid #cfd8d1; border-radius: 8px; padding: 12px; font: inherit; }.job-form input { border: 1px solid #cfd8d1; border-radius: 8px; padding: 12px; font: inherit; }.job-form button { justify-self: start; }
++.job-package-result { display: grid; gap: 22px; margin-top: 28px; }.cover-letter { padding: 24px; border: 1px solid #cdddcf; border-radius: 10px; background: #fcfdfb; }.cover-letter .resume-heading { margin-bottom: 14px; }.cover-letter p { line-height: 1.6; margin: 0 0 12px; }
++.gap-analysis { padding: 24px; border: 1px solid #cdddcf; border-radius: 10px; background: #fcfdfb; }.gap-analysis h4 { margin: 18px 0 8px; font-size: .82rem; color: #216545; letter-spacing: .08em; text-transform: uppercase; }.gap-analysis ul { list-style: disc; padding-left: 20px; margin: 0; display: block; gap: 0; }.gap-analysis li { line-height: 1.5; margin-bottom: 6px; }.gap-analysis .gaps li { color: #8a3a22; }.gap-analysis .suggestions li { color: #1c4a35; }.score-reasoning { color: #516058; line-height: 1.5; margin: 4px 0 0; }
++.score-badge { padding: 6px 14px; border-radius: 99px; font-weight: 700; font-size: .85rem; white-space: nowrap; }.score-high { background: #dcecdf; color: #216545; }.score-mid { background: #eef0d8; color: #6b6420; }.score-low { background: #f6e6d8; color: #96551f; }.score-very-low { background: #f7dcd4; color: #9b3927; }
