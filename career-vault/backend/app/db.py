@@ -90,6 +90,27 @@ class ResumeDraft(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
+class JobPackageDraft(Base):
+    """A job-specific resume + cover letter pair tailored to one job posting.
+
+    Kept separate from ResumeDraft (rather than adding nullable columns to it) so the
+    existing master-resume table and flow are untouched. Only approved CareerRecord
+    evidence is ever used to produce the resume/cover letter content stored here.
+    """
+
+    __tablename__ = "job_package_drafts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    job_title: Mapped[str] = mapped_column(String(200))
+    job_description: Mapped[str] = mapped_column(Text)
+    resume: Mapped[dict] = mapped_column(JSON)
+    cover_letter: Mapped[str] = mapped_column(Text)
+    keyword_matches: Mapped[dict] = mapped_column(JSON)
+    gap_analysis: Mapped[dict] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
 data_directory.mkdir(parents=True, exist_ok=True)
 engine = create_engine(f"sqlite:///{database_path}", connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)

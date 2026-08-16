@@ -18,6 +18,7 @@ from app.db import (
     CareerInterviewSession,
     CareerRecord,
     FactProposal,
+    JobPackageDraft,
     ResumeDraft,
     SessionLocal,
     User,
@@ -25,7 +26,7 @@ from app.db import (
 )
 from app.interview import STAGES, next_stage, stage_for
 from app.providers.ollama import OllamaProvider
-from app.resume_document import render_master_resume
+from app.resume_document import render_cover_letter, render_master_resume, render_tailored_resume
 
 password_hash = PasswordHash.recommended()
 bearer = HTTPBearer(auto_error=False)
@@ -82,8 +83,26 @@ class ProposalDecisionRequest(BaseModel):
     decision: str = Field(pattern="^(approved|rejected)$")
 
 
+class JobPackageRequest(BaseModel):
+    job_title: str = Field(min_length=2, max_length=200)
+    job_description: str = Field(min_length=30, max_length=8000)
+
+
 def serialize_resume(draft: ResumeDraft) -> dict:
     return {"id": draft.id, "type": draft.resume_type, "content": draft.content, "created_at": draft.created_at.isoformat()}
+
+
+def serialize_job_package(draft: JobPackageDraft) -> dict:
+    return {
+        "id": draft.id,
+        "job_title": draft.job_title,
+        "job_description": draft.job_description,
+        "resume": draft.resume,
+        "cover_letter": draft.cover_letter,
+        "keyword_matches": draft.keyword_matches,
+        "gap_analysis": draft.gap_analysis,
+        "created_at": draft.created_at.isoformat(),
+    }
 
 
 def get_db():
@@ -335,4 +354,63 @@ def download_master_resume_docx(resume_id: str, user: User = Depends(get_current
     export_path = export_directory / user.id / f"career-vault-master-resume-{draft.id}.docx"
     render_master_resume(export_path, user.display_name, draft.content)
     filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-master-resume.docx"
+    return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
+
+
+@app.post("/api/job-packages")
+async def generate_job_package(
+    payload: JobPackageRequest, user: User = Depends(get_current_user), db: Session = Depends(get_db)
+) -> dict:
+    records = db.scalars(select(CareerRecord).where(CareerRecord.user_id == user.id).order_by(CareerRecord.created_at)).all()
+    if not records:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Approve some Career Vault facts before tailoring a resume to a job")
+    package = await OllamaProvider().job_specific_package(
+        [{"type": item.record_type, "summary": item.summary, "data": item.data} for item in records],
+        payload.job_title.strip(),
+        payload.job_description.strip(),
+    )
+    draft = JobPackageDraft(
+        user_id=user.id,
+        job_title=payload.job_title.strip(),
+        job_description=payload.job_description.strip(),
+        resume=package["resume"],
+        cover_letter=package["cover_letter"],
+        keyword_matches=package["keyword_matches"],
+        gap_analysis=package["gap_analysis"],
+    )
+    db.add(draft)
+    db.commit()
+    db.refresh(draft)
+    return serialize_job_package(draft) | {"evidence_count": len(records)}
+
+
+@app.get("/api/job-packages")
+def list_job_packages(user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> list[dict]:
+    drafts = db.scalars(
+        select(JobPackageDraft).where(JobPackageDraft.user_id == user.id).order_by(JobPackageDraft.created_at.desc())
+    ).all()
+    return [serialize_job_package(draft) for draft in drafts]
+
+
+@app.get("/api/job-packages/{package_id}/download/resume-docx")
+def download_job_resume_docx(package_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> FileResponse:
+    draft = db.get(JobPackageDraft, package_id)
+    if not draft or draft.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Tailored resume not found")
+    export_directory = data_directory / "exports"
+    export_path = export_directory / user.id / f"career-vault-job-resume-{draft.id}.docx"
+    render_tailored_resume(export_path, user.display_name, draft.resume)
+    filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-{draft.job_title.strip().replace(' ', '-').lower() or 'tailored'}-resume.docx"
+    return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
+
+
+@app.get("/api/job-packages/{package_id}/download/cover-letter-docx")
+def download_job_cover_letter_docx(package_id: str, user: User = Depends(get_current_user), db: Session = Depends(get_db)) -> FileResponse:
+    draft = db.get(JobPackageDraft, package_id)
+    if not draft or draft.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Tailored cover letter not found")
+    export_directory = data_directory / "exports"
+    export_path = export_directory / user.id / f"career-vault-job-cover-letter-{draft.id}.docx"
+    render_cover_letter(export_path, user.display_name, draft.job_title, draft.cover_letter)
+    filename = f"{user.display_name.strip().replace(' ', '-').lower() or 'career-vault'}-{draft.job_title.strip().replace(' ', '-').lower() or 'tailored'}-cover-letter.docx"
     return FileResponse(export_path, media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document", filename=filename)
