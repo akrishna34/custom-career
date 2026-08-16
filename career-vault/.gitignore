@@ -1,0 +1,18 @@
+# Python
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/.pytest_cache/
+
+# JavaScript
+frontend/node_modules/
+frontend/dist/
+
+# Local-only application data
+data/
+*.db
+*.sqlite3
+.env
+
+# macOS
+.DS_Store
